@@ -1,14 +1,15 @@
 'use client';
 
-import { useRef, useCallback } from 'react';
+import { useRef, useCallback, useState } from 'react';
 import { Canvas, useThree, useFrame, ThreeEvent } from '@react-three/fiber';
 import { OrbitControls, Stars, Text } from '@react-three/drei';
 import * as THREE from 'three';
+import type { OrbitControls as OrbitControlsImpl } from 'three-stdlib';
 import { GraphEdge3D } from './GraphEdge3D';
 import { useGraphStore } from '@/store/graphStore';
 import type { GraphNode } from '@/types';
 
-// ─── Single Node mesh (no inner group, position handled by parent) ────────────
+// ─── Node mesh ────────────────────────────────────────────────────────────────
 
 function NodeMesh({
   node,
@@ -17,15 +18,17 @@ function NodeMesh({
   isConnectSource,
   isConnectTarget,
   onClick,
-  onHover,
+  onPointerOver,
+  onPointerOut,
 }: {
   node: GraphNode;
   isSelected: boolean;
   isHovered: boolean;
   isConnectSource: boolean;
   isConnectTarget: boolean;
-  onClick: () => void;
-  onHover: (over: boolean) => void;
+  onClick: (e: ThreeEvent<MouseEvent>) => void;
+  onPointerOver: (e: ThreeEvent<PointerEvent>) => void;
+  onPointerOut: (e: ThreeEvent<PointerEvent>) => void;
 }) {
   const meshRef = useRef<THREE.Mesh>(null);
   const glowRef = useRef<THREE.Mesh>(null);
@@ -34,11 +37,9 @@ function NodeMesh({
     if (!meshRef.current || !glowRef.current) return;
     const time = state.clock.elapsedTime;
 
-    // Scale
     const targetScale = isSelected || isConnectSource ? 1.35 : isHovered || isConnectTarget ? 1.15 : 1.0;
     meshRef.current.scale.lerp(new THREE.Vector3(targetScale, targetScale, targetScale), delta * 10);
 
-    // Glow
     const glowScale = isSelected || isConnectSource
       ? 1.9 + Math.sin(time * 3) * 0.2
       : isHovered || isConnectTarget
@@ -46,51 +47,39 @@ function NodeMesh({
       : 1.3 + Math.sin(time * 1.5) * 0.05;
     glowRef.current.scale.setScalar(glowScale);
 
-    // Emissive
     const mat = meshRef.current.material as THREE.MeshStandardMaterial;
     if (mat) {
       const target = isSelected || isConnectSource ? 1.0 : isHovered || isConnectTarget ? 0.6 : 0.2;
       mat.emissiveIntensity = THREE.MathUtils.lerp(mat.emissiveIntensity, target, delta * 6);
     }
-
-    // Glow opacity
-    const glowMat = glowRef.current.material as THREE.MeshBasicMaterial;
-    if (glowMat) {
-      const targetOpacity = isConnectSource ? 0.3 : isSelected ? 0.15 : isHovered ? 0.1 : 0.05;
-      glowMat.opacity = THREE.MathUtils.lerp(glowMat.opacity, targetOpacity, delta * 6);
-    }
   });
 
-  // Pick the glow color: cyan for connect-source, normal otherwise
   const glowColor = isConnectSource ? '#22d3ee' : node.color;
+  const nodeColor = isConnectSource ? '#22d3ee' : node.color;
 
   return (
     <>
-      {/* Outer glow */}
       <mesh ref={glowRef}>
         <sphereGeometry args={[0.35, 16, 16]} />
-        <meshBasicMaterial color={glowColor} transparent opacity={0.05} depthWrite={false} />
+        <meshBasicMaterial color={glowColor} transparent opacity={0.06} depthWrite={false} />
       </mesh>
 
-      {/* Main sphere */}
       <mesh
         ref={meshRef}
-        onClick={(e) => { e.stopPropagation(); onClick(); }}
-        onPointerOver={(e) => { e.stopPropagation(); onHover(true); }}
-        onPointerOut={() => onHover(false)}
-        castShadow
+        onClick={onClick}
+        onPointerOver={onPointerOver}
+        onPointerOut={onPointerOut}
       >
         <sphereGeometry args={[0.25, 32, 32]} />
         <meshStandardMaterial
-          color={isConnectSource ? '#22d3ee' : node.color}
-          emissive={isConnectSource ? '#22d3ee' : node.color}
+          color={nodeColor}
+          emissive={nodeColor}
           emissiveIntensity={0.2}
           roughness={0.2}
           metalness={0.6}
         />
       </mesh>
 
-      {/* Selection ring */}
       {(isSelected || isConnectSource) && (
         <mesh rotation={[Math.PI / 2, 0, 0]}>
           <torusGeometry args={[0.38, 0.025, 8, 48]} />
@@ -98,7 +87,6 @@ function NodeMesh({
         </mesh>
       )}
 
-      {/* Connect-target ring (dashed look via thin torus) */}
       {isConnectTarget && (
         <mesh rotation={[Math.PI / 2, 0, 0]}>
           <torusGeometry args={[0.42, 0.015, 8, 48]} />
@@ -106,7 +94,6 @@ function NodeMesh({
         </mesh>
       )}
 
-      {/* Label */}
       <Text
         position={[0, 0.48, 0]}
         fontSize={0.12}
@@ -123,7 +110,7 @@ function NodeMesh({
   );
 }
 
-// ─── Draggable wrapper ────────────────────────────────────────────────────────
+// ─── Draggable node wrapper ───────────────────────────────────────────────────
 
 function DraggableNode({
   node,
@@ -131,8 +118,9 @@ function DraggableNode({
   isHovered,
   isConnectSource,
   isConnectTarget,
+  orbitRef,
   onNodeClick,
-  onHover,
+  onHoverChange,
   onDragEnd,
 }: {
   node: GraphNode;
@@ -140,73 +128,106 @@ function DraggableNode({
   isHovered: boolean;
   isConnectSource: boolean;
   isConnectTarget: boolean;
+  orbitRef: React.RefObject<OrbitControlsImpl>;
   onNodeClick: (id: string) => void;
-  onHover: (id: string | null) => void;
+  onHoverChange: (id: string | null) => void;
   onDragEnd: (id: string, x: number, y: number, z: number) => void;
 }) {
   const groupRef = useRef<THREE.Group>(null);
   const isDragging = useRef(false);
-  const pointerMoved = useRef(false);
+  const didMove = useRef(false);
+  const pointerDownPos = useRef({ x: 0, y: 0 });
   const dragPlane = useRef(new THREE.Plane());
   const { camera, gl } = useThree();
 
-  const handlePointerDown = useCallback(
-    (e: ThreeEvent<PointerEvent>) => {
-      // In connect mode don't drag
-      if (isConnectTarget || isConnectSource) return;
-      e.stopPropagation();
+  const handlePointerOver = useCallback((e: ThreeEvent<PointerEvent>) => {
+    e.stopPropagation();
+    onHoverChange(node.id);
+    document.body.style.cursor = isConnectTarget ? 'crosshair' : 'pointer';
+    // Disable orbit while hovering so clicks register on nodes
+    if (orbitRef.current) orbitRef.current.enabled = false;
+  }, [node.id, onHoverChange, isConnectTarget, orbitRef]);
+
+  const handlePointerOut = useCallback((e: ThreeEvent<PointerEvent>) => {
+    e.stopPropagation();
+    onHoverChange(null);
+    document.body.style.cursor = 'default';
+    if (!isDragging.current && orbitRef.current) {
+      orbitRef.current.enabled = true;
+    }
+  }, [onHoverChange, orbitRef]);
+
+  const handlePointerDown = useCallback((e: ThreeEvent<PointerEvent>) => {
+    e.stopPropagation();
+    isDragging.current = false;
+    didMove.current = false;
+    pointerDownPos.current = { x: e.clientX, y: e.clientY };
+
+    // Disable orbit during potential drag
+    if (orbitRef.current) orbitRef.current.enabled = false;
+
+    const normal = new THREE.Vector3();
+    camera.getWorldDirection(normal);
+    dragPlane.current.setFromNormalAndCoplanarPoint(
+      normal,
+      new THREE.Vector3(node.x, node.y, node.z)
+    );
+
+    gl.domElement.setPointerCapture(e.pointerId);
+  }, [camera, gl, node.x, node.y, node.z, orbitRef]);
+
+  const handlePointerMove = useCallback((e: ThreeEvent<PointerEvent>) => {
+    if (!groupRef.current) return;
+
+    const dx = e.clientX - pointerDownPos.current.x;
+    const dy = e.clientY - pointerDownPos.current.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+
+    // Only start dragging after moving 5px — prevents accidental drags
+    if (dist > 5) {
       isDragging.current = true;
-      pointerMoved.current = false;
-
-      const normal = new THREE.Vector3();
-      camera.getWorldDirection(normal);
-      dragPlane.current.setFromNormalAndCoplanarPoint(
-        normal,
-        new THREE.Vector3(node.x, node.y, node.z)
-      );
-
-      gl.domElement.setPointerCapture(e.pointerId);
+      didMove.current = true;
       gl.domElement.style.cursor = 'grabbing';
-    },
-    [isConnectTarget, isConnectSource, camera, gl, node.x, node.y, node.z]
-  );
+    }
 
-  const handlePointerMove = useCallback(
-    (e: ThreeEvent<PointerEvent>) => {
-      if (!isDragging.current || !groupRef.current) return;
-      e.stopPropagation();
-      pointerMoved.current = true;
+    if (!isDragging.current) return;
+    e.stopPropagation();
 
-      const rect = gl.domElement.getBoundingClientRect();
-      const mouse = new THREE.Vector2(
-        ((e.clientX - rect.left) / rect.width) * 2 - 1,
-        -((e.clientY - rect.top) / rect.height) * 2 + 1
-      );
-      const raycaster = new THREE.Raycaster();
-      raycaster.setFromCamera(mouse, camera);
+    const rect = gl.domElement.getBoundingClientRect();
+    const mouse = new THREE.Vector2(
+      ((e.clientX - rect.left) / rect.width) * 2 - 1,
+      -((e.clientY - rect.top) / rect.height) * 2 + 1
+    );
+    const raycaster = new THREE.Raycaster();
+    raycaster.setFromCamera(mouse, camera);
 
-      const target = new THREE.Vector3();
-      if (raycaster.ray.intersectPlane(dragPlane.current, target)) {
-        groupRef.current.position.set(target.x, target.y, target.z);
-      }
-    },
-    [camera, gl]
-  );
+    const target = new THREE.Vector3();
+    if (raycaster.ray.intersectPlane(dragPlane.current, target)) {
+      groupRef.current.position.set(target.x, target.y, target.z);
+    }
+  }, [camera, gl]);
 
-  const handlePointerUp = useCallback(
-    (e: ThreeEvent<PointerEvent>) => {
-      if (!isDragging.current) return;
-      e.stopPropagation();
-      isDragging.current = false;
-      gl.domElement.style.cursor = 'default';
+  const handlePointerUp = useCallback((e: ThreeEvent<PointerEvent>) => {
+    e.stopPropagation();
+    gl.domElement.style.cursor = 'pointer';
 
-      if (groupRef.current && pointerMoved.current) {
-        const pos = groupRef.current.position;
-        onDragEnd(node.id, pos.x, pos.y, pos.z);
-      }
-    },
-    [node.id, onDragEnd, gl]
-  );
+    if (isDragging.current && groupRef.current) {
+      const pos = groupRef.current.position;
+      onDragEnd(node.id, pos.x, pos.y, pos.z);
+    }
+
+    isDragging.current = false;
+    // Re-enable orbit after drag/click
+    if (orbitRef.current) orbitRef.current.enabled = true;
+  }, [node.id, onDragEnd, gl, orbitRef]);
+
+  const handleClick = useCallback((e: ThreeEvent<MouseEvent>) => {
+    e.stopPropagation();
+    // Only fire click if we didn't drag
+    if (!didMove.current) {
+      onNodeClick(node.id);
+    }
+  }, [node.id, onNodeClick]);
 
   return (
     <group
@@ -222,13 +243,9 @@ function DraggableNode({
         isHovered={isHovered}
         isConnectSource={isConnectSource}
         isConnectTarget={isConnectTarget}
-        onClick={() => onNodeClick(node.id)}
-        onHover={(over) => {
-          onHover(over ? node.id : null);
-          document.body.style.cursor = over
-            ? isConnectTarget ? 'crosshair' : 'pointer'
-            : 'default';
-        }}
+        onClick={handleClick}
+        onPointerOver={handlePointerOver}
+        onPointerOut={handlePointerOut}
       />
     </group>
   );
@@ -238,16 +255,17 @@ function DraggableNode({
 
 function AmbientParticles() {
   const pointsRef = useRef<THREE.Points>(null);
-  const positions = useRef(() => {
-    const count = 200;
-    const arr = new Float32Array(count * 3);
-    for (let i = 0; i < count; i++) {
-      arr[i * 3] = (Math.random() - 0.5) * 30;
-      arr[i * 3 + 1] = (Math.random() - 0.5) * 30;
-      arr[i * 3 + 2] = (Math.random() - 0.5) * 30;
-    }
-    return arr;
-  }).current();
+  const positions = useRef<Float32Array>(
+    (() => {
+      const arr = new Float32Array(200 * 3);
+      for (let i = 0; i < 200; i++) {
+        arr[i * 3] = (Math.random() - 0.5) * 30;
+        arr[i * 3 + 1] = (Math.random() - 0.5) * 30;
+        arr[i * 3 + 2] = (Math.random() - 0.5) * 30;
+      }
+      return arr;
+    })()
+  ).current;
 
   useFrame((state) => {
     if (!pointsRef.current) return;
@@ -265,65 +283,57 @@ function AmbientParticles() {
   );
 }
 
-// ─── Main scene ───────────────────────────────────────────────────────────────
+// ─── Scene ────────────────────────────────────────────────────────────────────
 
-function Scene({ onBackgroundClick }: { onBackgroundClick: () => void }) {
+function Scene({ orbitRef }: { orbitRef: React.RefObject<OrbitControlsImpl> }) {
   const {
     nodes, edges,
     selectedNodeId, hoveredNodeId, connectingFromId,
     setSelectedNode, setHoveredNode, setConnectingFrom, addEdge, updateNodePosition,
   } = useGraphStore();
 
-  // Unified node click handler — handles both select and connect modes
-  const handleNodeClick = useCallback(
-    async (id: string) => {
-      // No connect mode — just select
-      if (!connectingFromId) {
-        setSelectedNode(id);
-        return;
-      }
+  const handleNodeClick = useCallback(async (id: string) => {
+    if (!connectingFromId) {
+      setSelectedNode(id);
+      return;
+    }
+    if (connectingFromId === id) {
+      setConnectingFrom(null);
+      return;
+    }
+    try {
+      const res = await fetch('/api/edges', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fromId: connectingFromId, toId: id }),
+      });
+      const data = await res.json();
+      if (data.edge) addEdge(data.edge);
+    } catch (err) {
+      console.error('Failed to create edge:', err);
+    } finally {
+      setConnectingFrom(null);
+    }
+  }, [connectingFromId, setSelectedNode, setConnectingFrom, addEdge]);
 
-      // Clicked the source node again → cancel
-      if (connectingFromId === id) {
-        setConnectingFrom(null);
-        return;
-      }
+  const handleDragEnd = useCallback(async (id: string, x: number, y: number, z: number) => {
+    updateNodePosition(id, x, y, z);
+    try {
+      await fetch(`/api/nodes/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ x, y, z }),
+      });
+    } catch (err) {
+      console.error('Failed to save position:', err);
+    }
+  }, [updateNodePosition]);
 
-      // Connect source → this node
-      try {
-        const res = await fetch('/api/edges', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ fromId: connectingFromId, toId: id }),
-        });
-        const data = await res.json();
-        if (data.edge) {
-          addEdge(data.edge);
-        }
-      } catch (err) {
-        console.error('Failed to create edge:', err);
-      } finally {
-        setConnectingFrom(null);
-      }
-    },
-    [connectingFromId, setSelectedNode, setConnectingFrom, addEdge]
-  );
-
-  const handleDragEnd = useCallback(
-    async (id: string, x: number, y: number, z: number) => {
-      updateNodePosition(id, x, y, z);
-      try {
-        await fetch(`/api/nodes/${id}`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ x, y, z }),
-        });
-      } catch (err) {
-        console.error('Failed to save position:', err);
-      }
-    },
-    [updateNodePosition]
-  );
+  const handleBackgroundClick = useCallback(() => {
+    setSelectedNode(null);
+    setConnectingFrom(null);
+    if (orbitRef.current) orbitRef.current.enabled = true;
+  }, [setSelectedNode, setConnectingFrom, orbitRef]);
 
   return (
     <>
@@ -336,24 +346,21 @@ function Scene({ onBackgroundClick }: { onBackgroundClick: () => void }) {
       <AmbientParticles />
       <gridHelper args={[40, 40, '#1e293b', '#0f172a']} position={[0, -5, 0]} />
 
-      {/* Edges */}
       {edges.map((edge) => {
         const fromNode = nodes.find((n) => n.id === edge.fromId);
         const toNode = nodes.find((n) => n.id === edge.toId);
         if (!fromNode || !toNode) return null;
-        const isHighlighted = selectedNodeId === edge.fromId || selectedNodeId === edge.toId;
         return (
           <GraphEdge3D
             key={edge.id}
             edge={edge}
             fromNode={fromNode}
             toNode={toNode}
-            isHighlighted={isHighlighted}
+            isHighlighted={selectedNodeId === edge.fromId || selectedNodeId === edge.toId}
           />
         );
       })}
 
-      {/* Nodes */}
       {nodes.map((node) => (
         <DraggableNode
           key={node.id}
@@ -362,19 +369,21 @@ function Scene({ onBackgroundClick }: { onBackgroundClick: () => void }) {
           isHovered={hoveredNodeId === node.id}
           isConnectSource={connectingFromId === node.id}
           isConnectTarget={!!connectingFromId && connectingFromId !== node.id}
+          orbitRef={orbitRef}
           onNodeClick={handleNodeClick}
-          onHover={setHoveredNode}
+          onHoverChange={setHoveredNode}
           onDragEnd={handleDragEnd}
         />
       ))}
 
-      {/* Invisible background plane to catch deselect clicks */}
-      <mesh position={[0, 0, -20]} onClick={onBackgroundClick} visible={false}>
+      {/* Background click to deselect */}
+      <mesh position={[0, 0, -20]} onClick={handleBackgroundClick} visible={false}>
         <planeGeometry args={[1000, 1000]} />
         <meshBasicMaterial />
       </mesh>
 
       <OrbitControls
+        ref={orbitRef}
         enableDamping
         dampingFactor={0.05}
         rotateSpeed={0.5}
@@ -391,12 +400,7 @@ function Scene({ onBackgroundClick }: { onBackgroundClick: () => void }) {
 // ─── Canvas export ────────────────────────────────────────────────────────────
 
 export function GraphScene() {
-  const { setSelectedNode, setConnectingFrom } = useGraphStore();
-
-  const handleBackgroundClick = useCallback(() => {
-    setSelectedNode(null);
-    setConnectingFrom(null);
-  }, [setSelectedNode, setConnectingFrom]);
+  const orbitRef = useRef<OrbitControlsImpl>(null);
 
   return (
     <Canvas
@@ -406,7 +410,7 @@ export function GraphScene() {
       performance={{ min: 0.5 }}
       style={{ background: 'transparent' }}
     >
-      <Scene onBackgroundClick={handleBackgroundClick} />
+      <Scene orbitRef={orbitRef} />
     </Canvas>
   );
 }
