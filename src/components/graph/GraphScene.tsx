@@ -54,18 +54,26 @@ function NodeMesh({
     }
   });
 
-  const glowColor = isConnectSource ? '#22d3ee' : node.color;
   const nodeColor = isConnectSource ? '#22d3ee' : node.color;
 
   return (
     <>
-      <mesh ref={glowRef}>
-        <sphereGeometry args={[0.35, 16, 16]} />
-        <meshBasicMaterial color={glowColor} transparent opacity={0.06} depthWrite={false} />
+      {/* Glow — rendered behind, no depth write so it never occludes the main sphere */}
+      <mesh ref={glowRef} renderOrder={0}>
+        <sphereGeometry args={[0.38, 16, 16]} />
+        <meshBasicMaterial
+          color={nodeColor}
+          transparent
+          opacity={0.06}
+          depthWrite={false}
+          side={THREE.BackSide}
+        />
       </mesh>
 
+      {/* Main sphere — always on top of glow */}
       <mesh
         ref={meshRef}
+        renderOrder={1}
         onClick={onClick}
         onPointerOver={onPointerOver}
         onPointerOut={onPointerOut}
@@ -80,17 +88,24 @@ function NodeMesh({
         />
       </mesh>
 
+      {/* Selection / source ring */}
       {(isSelected || isConnectSource) && (
-        <mesh rotation={[Math.PI / 2, 0, 0]}>
+        <mesh rotation={[Math.PI / 2, 0, 0]} renderOrder={2}>
           <torusGeometry args={[0.38, 0.025, 8, 48]} />
-          <meshBasicMaterial color={isConnectSource ? '#22d3ee' : node.color} transparent opacity={0.9} />
+          <meshBasicMaterial
+            color={isConnectSource ? '#22d3ee' : node.color}
+            transparent
+            opacity={0.9}
+            depthWrite={false}
+          />
         </mesh>
       )}
 
+      {/* Connect-target ring */}
       {isConnectTarget && (
-        <mesh rotation={[Math.PI / 2, 0, 0]}>
+        <mesh rotation={[Math.PI / 2, 0, 0]} renderOrder={2}>
           <torusGeometry args={[0.42, 0.015, 8, 48]} />
-          <meshBasicMaterial color="#22d3ee" transparent opacity={0.5} />
+          <meshBasicMaterial color="#22d3ee" transparent opacity={0.5} depthWrite={false} />
         </mesh>
       )}
 
@@ -103,6 +118,7 @@ function NodeMesh({
         maxWidth={2.5}
         outlineWidth={0.012}
         outlineColor="#000000"
+        renderOrder={3}
       >
         {node.title.length > 22 ? node.title.slice(0, 22) + '…' : node.title}
       </Text>
