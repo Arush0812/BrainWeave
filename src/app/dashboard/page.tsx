@@ -52,7 +52,7 @@ export default function DashboardPage() {
           const id = stack.pop()!;
           if (visited.has(id)) continue;
           visited.add(id);
-          for (const neighbor of adjacency.get(id) ?? []) {
+          for (const neighbor of Array.from(adjacency.get(id) ?? [])) {
             if (!visited.has(neighbor)) stack.push(neighbor);
           }
         }
