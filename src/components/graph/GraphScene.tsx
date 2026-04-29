@@ -1,56 +1,196 @@
 'use client';
 
-import { useRef, useCallback, useEffect } from 'react';
+import { useRef, useCallback } from 'react';
 import { Canvas, useThree, useFrame, ThreeEvent } from '@react-three/fiber';
-import { OrbitControls, Stars, Environment } from '@react-three/drei';
+import { OrbitControls, Stars, Text } from '@react-three/drei';
 import * as THREE from 'three';
-import { GraphNode3D } from './GraphNode3D';
 import { GraphEdge3D } from './GraphEdge3D';
 import { useGraphStore } from '@/store/graphStore';
 import type { GraphNode } from '@/types';
 
-// ─── Drag handler component ───────────────────────────────────────────────────
+// ─── Single Node mesh (no inner group, position handled by parent) ────────────
+
+function NodeMesh({
+  node,
+  isSelected,
+  isHovered,
+  isConnectSource,
+  isConnectTarget,
+  onClick,
+  onHover,
+}: {
+  node: GraphNode;
+  isSelected: boolean;
+  isHovered: boolean;
+  isConnectSource: boolean;
+  isConnectTarget: boolean;
+  onClick: () => void;
+  onHover: (over: boolean) => void;
+}) {
+  const meshRef = useRef<THREE.Mesh>(null);
+  const glowRef = useRef<THREE.Mesh>(null);
+
+  useFrame((state, delta) => {
+    if (!meshRef.current || !glowRef.current) return;
+    const time = state.clock.elapsedTime;
+
+    // Scale
+    const targetScale = isSelected || isConnectSource ? 1.35 : isHovered || isConnectTarget ? 1.15 : 1.0;
+    meshRef.current.scale.lerp(new THREE.Vector3(targetScale, targetScale, targetScale), delta * 10);
+
+    // Glow
+    const glowScale = isSelected || isConnectSource
+      ? 1.9 + Math.sin(time * 3) * 0.2
+      : isHovered || isConnectTarget
+      ? 1.6 + Math.sin(time * 2) * 0.1
+      : 1.3 + Math.sin(time * 1.5) * 0.05;
+    glowRef.current.scale.setScalar(glowScale);
+
+    // Emissive
+    const mat = meshRef.current.material as THREE.MeshStandardMaterial;
+    if (mat) {
+      const target = isSelected || isConnectSource ? 1.0 : isHovered || isConnectTarget ? 0.6 : 0.2;
+      mat.emissiveIntensity = THREE.MathUtils.lerp(mat.emissiveIntensity, target, delta * 6);
+    }
+
+    // Glow opacity
+    const glowMat = glowRef.current.material as THREE.MeshBasicMaterial;
+    if (glowMat) {
+      const targetOpacity = isConnectSource ? 0.3 : isSelected ? 0.15 : isHovered ? 0.1 : 0.05;
+      glowMat.opacity = THREE.MathUtils.lerp(glowMat.opacity, targetOpacity, delta * 6);
+    }
+  });
+
+  // Pick the glow color: cyan for connect-source, normal otherwise
+  const glowColor = isConnectSource ? '#22d3ee' : node.color;
+
+  return (
+    <>
+      {/* Outer glow */}
+      <mesh ref={glowRef}>
+        <sphereGeometry args={[0.35, 16, 16]} />
+        <meshBasicMaterial color={glowColor} transparent opacity={0.05} depthWrite={false} />
+      </mesh>
+
+      {/* Main sphere */}
+      <mesh
+        ref={meshRef}
+        onClick={(e) => { e.stopPropagation(); onClick(); }}
+        onPointerOver={(e) => { e.stopPropagation(); onHover(true); }}
+        onPointerOut={() => onHover(false)}
+        castShadow
+      >
+        <sphereGeometry args={[0.25, 32, 32]} />
+        <meshStandardMaterial
+          color={isConnectSource ? '#22d3ee' : node.color}
+          emissive={isConnectSource ? '#22d3ee' : node.color}
+          emissiveIntensity={0.2}
+          roughness={0.2}
+          metalness={0.6}
+        />
+      </mesh>
+
+      {/* Selection ring */}
+      {(isSelected || isConnectSource) && (
+        <mesh rotation={[Math.PI / 2, 0, 0]}>
+          <torusGeometry args={[0.38, 0.025, 8, 48]} />
+          <meshBasicMaterial color={isConnectSource ? '#22d3ee' : node.color} transparent opacity={0.9} />
+        </mesh>
+      )}
+
+      {/* Connect-target ring (dashed look via thin torus) */}
+      {isConnectTarget && (
+        <mesh rotation={[Math.PI / 2, 0, 0]}>
+          <torusGeometry args={[0.42, 0.015, 8, 48]} />
+          <meshBasicMaterial color="#22d3ee" transparent opacity={0.5} />
+        </mesh>
+      )}
+
+      {/* Label */}
+      <Text
+        position={[0, 0.48, 0]}
+        fontSize={0.12}
+        color="white"
+        anchorX="center"
+        anchorY="bottom"
+        maxWidth={2.5}
+        outlineWidth={0.012}
+        outlineColor="#000000"
+      >
+        {node.title.length > 22 ? node.title.slice(0, 22) + '…' : node.title}
+      </Text>
+    </>
+  );
+}
+
+// ─── Draggable wrapper ────────────────────────────────────────────────────────
 
 function DraggableNode({
   node,
   isSelected,
   isHovered,
-  isConnecting,
-  onSelect,
+  isConnectSource,
+  isConnectTarget,
+  onNodeClick,
   onHover,
   onDragEnd,
-  onConnectClick,
 }: {
   node: GraphNode;
   isSelected: boolean;
   isHovered: boolean;
-  isConnecting: boolean;
-  onSelect: (id: string) => void;
+  isConnectSource: boolean;
+  isConnectTarget: boolean;
+  onNodeClick: (id: string) => void;
   onHover: (id: string | null) => void;
   onDragEnd: (id: string, x: number, y: number, z: number) => void;
-  onConnectClick: (id: string) => void;
 }) {
   const groupRef = useRef<THREE.Group>(null);
   const isDragging = useRef(false);
-  const dragPlane = useRef(new THREE.Plane(new THREE.Vector3(0, 0, 1), 0));
+  const pointerMoved = useRef(false);
+  const dragPlane = useRef(new THREE.Plane());
   const { camera, gl } = useThree();
 
   const handlePointerDown = useCallback(
     (e: ThreeEvent<PointerEvent>) => {
-      if (isConnecting) return;
+      // In connect mode don't drag
+      if (isConnectTarget || isConnectSource) return;
       e.stopPropagation();
       isDragging.current = true;
-      gl.domElement.style.cursor = 'grabbing';
+      pointerMoved.current = false;
 
-      // Update drag plane to face camera
       const normal = new THREE.Vector3();
       camera.getWorldDirection(normal);
       dragPlane.current.setFromNormalAndCoplanarPoint(
         normal,
         new THREE.Vector3(node.x, node.y, node.z)
       );
+
+      gl.domElement.setPointerCapture(e.pointerId);
+      gl.domElement.style.cursor = 'grabbing';
     },
-    [isConnecting, camera, gl, node.x, node.y, node.z]
+    [isConnectTarget, isConnectSource, camera, gl, node.x, node.y, node.z]
+  );
+
+  const handlePointerMove = useCallback(
+    (e: ThreeEvent<PointerEvent>) => {
+      if (!isDragging.current || !groupRef.current) return;
+      e.stopPropagation();
+      pointerMoved.current = true;
+
+      const rect = gl.domElement.getBoundingClientRect();
+      const mouse = new THREE.Vector2(
+        ((e.clientX - rect.left) / rect.width) * 2 - 1,
+        -((e.clientY - rect.top) / rect.height) * 2 + 1
+      );
+      const raycaster = new THREE.Raycaster();
+      raycaster.setFromCamera(mouse, camera);
+
+      const target = new THREE.Vector3();
+      if (raycaster.ray.intersectPlane(dragPlane.current, target)) {
+        groupRef.current.position.set(target.x, target.y, target.z);
+      }
+    },
+    [camera, gl]
   );
 
   const handlePointerUp = useCallback(
@@ -60,7 +200,7 @@ function DraggableNode({
       isDragging.current = false;
       gl.domElement.style.cursor = 'default';
 
-      if (groupRef.current) {
+      if (groupRef.current && pointerMoved.current) {
         const pos = groupRef.current.position;
         onDragEnd(node.id, pos.x, pos.y, pos.z);
       }
@@ -68,45 +208,27 @@ function DraggableNode({
     [node.id, onDragEnd, gl]
   );
 
-  const handlePointerMove = useCallback(
-    (e: ThreeEvent<PointerEvent>) => {
-      if (!isDragging.current || !groupRef.current) return;
-      e.stopPropagation();
-
-      const raycaster = new THREE.Raycaster();
-      const mouse = new THREE.Vector2(
-        (e.clientX / gl.domElement.clientWidth) * 2 - 1,
-        -(e.clientY / gl.domElement.clientHeight) * 2 + 1
-      );
-      raycaster.setFromCamera(mouse, camera);
-
-      const target = new THREE.Vector3();
-      raycaster.ray.intersectPlane(dragPlane.current, target);
-
-      if (target) {
-        groupRef.current.position.set(target.x, target.y, target.z);
-      }
-    },
-    [camera, gl]
-  );
-
   return (
     <group
       ref={groupRef}
       position={[node.x, node.y, node.z]}
       onPointerDown={handlePointerDown}
-      onPointerUp={handlePointerUp}
       onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
     >
-      <GraphNode3D
+      <NodeMesh
         node={node}
         isSelected={isSelected}
         isHovered={isHovered}
-        isConnecting={isConnecting}
-        onSelect={onSelect}
-        onHover={onHover}
-        onDragEnd={onDragEnd}
-        onConnectClick={onConnectClick}
+        isConnectSource={isConnectSource}
+        isConnectTarget={isConnectTarget}
+        onClick={() => onNodeClick(node.id)}
+        onHover={(over) => {
+          onHover(over ? node.id : null);
+          document.body.style.cursor = over
+            ? isConnectTarget ? 'crosshair' : 'pointer'
+            : 'default';
+        }}
       />
     </group>
   );
@@ -116,17 +238,16 @@ function DraggableNode({
 
 function AmbientParticles() {
   const pointsRef = useRef<THREE.Points>(null);
-
-  const { positions, count } = (() => {
+  const positions = useRef(() => {
     const count = 200;
-    const positions = new Float32Array(count * 3);
+    const arr = new Float32Array(count * 3);
     for (let i = 0; i < count; i++) {
-      positions[i * 3] = (Math.random() - 0.5) * 30;
-      positions[i * 3 + 1] = (Math.random() - 0.5) * 30;
-      positions[i * 3 + 2] = (Math.random() - 0.5) * 30;
+      arr[i * 3] = (Math.random() - 0.5) * 30;
+      arr[i * 3 + 1] = (Math.random() - 0.5) * 30;
+      arr[i * 3 + 2] = (Math.random() - 0.5) * 30;
     }
-    return { positions, count };
-  })();
+    return arr;
+  }).current();
 
   useFrame((state) => {
     if (!pointsRef.current) return;
@@ -137,59 +258,60 @@ function AmbientParticles() {
   return (
     <points ref={pointsRef}>
       <bufferGeometry>
-        <bufferAttribute
-          attach="attributes-position"
-          count={count}
-          array={positions}
-          itemSize={3}
-        />
+        <bufferAttribute attach="attributes-position" count={200} array={positions} itemSize={3} />
       </bufferGeometry>
-      <pointsMaterial
-        size={0.03}
-        color="#6366f1"
-        transparent
-        opacity={0.4}
-        sizeAttenuation
-      />
+      <pointsMaterial size={0.03} color="#6366f1" transparent opacity={0.4} sizeAttenuation />
     </points>
-  );
-}
-
-// ─── Grid ─────────────────────────────────────────────────────────────────────
-
-function GridFloor() {
-  return (
-    <gridHelper
-      args={[40, 40, '#1e293b', '#0f172a']}
-      position={[0, -5, 0]}
-      rotation={[0, 0, 0]}
-    />
   );
 }
 
 // ─── Main scene ───────────────────────────────────────────────────────────────
 
-function Scene({
-  onBackgroundClick,
-}: {
-  onBackgroundClick: () => void;
-}) {
+function Scene({ onBackgroundClick }: { onBackgroundClick: () => void }) {
   const {
-    nodes,
-    edges,
-    selectedNodeId,
-    hoveredNodeId,
-    connectingFromId,
-    setSelectedNode,
-    setHoveredNode,
-    setConnectingFrom,
-    updateNodePosition,
+    nodes, edges,
+    selectedNodeId, hoveredNodeId, connectingFromId,
+    setSelectedNode, setHoveredNode, setConnectingFrom, addEdge, updateNodePosition,
   } = useGraphStore();
+
+  // Unified node click handler — handles both select and connect modes
+  const handleNodeClick = useCallback(
+    async (id: string) => {
+      // No connect mode — just select
+      if (!connectingFromId) {
+        setSelectedNode(id);
+        return;
+      }
+
+      // Clicked the source node again → cancel
+      if (connectingFromId === id) {
+        setConnectingFrom(null);
+        return;
+      }
+
+      // Connect source → this node
+      try {
+        const res = await fetch('/api/edges', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fromId: connectingFromId, toId: id }),
+        });
+        const data = await res.json();
+        if (data.edge) {
+          addEdge(data.edge);
+        }
+      } catch (err) {
+        console.error('Failed to create edge:', err);
+      } finally {
+        setConnectingFrom(null);
+      }
+    },
+    [connectingFromId, setSelectedNode, setConnectingFrom, addEdge]
+  );
 
   const handleDragEnd = useCallback(
     async (id: string, x: number, y: number, z: number) => {
       updateNodePosition(id, x, y, z);
-      // Debounced save to API
       try {
         await fetch(`/api/nodes/${id}`, {
           method: 'PATCH',
@@ -203,60 +325,23 @@ function Scene({
     [updateNodePosition]
   );
 
-  const handleConnectClick = useCallback(
-    async (id: string) => {
-      if (!connectingFromId) {
-        setConnectingFrom(id);
-        return;
-      }
-
-      if (connectingFromId === id) {
-        setConnectingFrom(null);
-        return;
-      }
-
-      // Create edge
-      try {
-        const res = await fetch('/api/edges', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ fromId: connectingFromId, toId: id }),
-        });
-        const data = await res.json();
-        if (data.edge) {
-          useGraphStore.getState().addEdge(data.edge);
-        }
-      } catch (err) {
-        console.error('Failed to create edge:', err);
-      } finally {
-        setConnectingFrom(null);
-      }
-    },
-    [connectingFromId, setConnectingFrom]
-  );
-
   return (
     <>
-      {/* Lighting */}
       <ambientLight intensity={0.3} />
       <pointLight position={[10, 10, 10]} intensity={0.8} color="#818cf8" />
       <pointLight position={[-10, -10, -10]} intensity={0.4} color="#c084fc" />
       <pointLight position={[0, 10, -10]} intensity={0.3} color="#38bdf8" />
 
-      {/* Background */}
       <Stars radius={100} depth={50} count={3000} factor={4} saturation={0} fade speed={0.5} />
       <AmbientParticles />
-      <GridFloor />
+      <gridHelper args={[40, 40, '#1e293b', '#0f172a']} position={[0, -5, 0]} />
 
       {/* Edges */}
       {edges.map((edge) => {
         const fromNode = nodes.find((n) => n.id === edge.fromId);
         const toNode = nodes.find((n) => n.id === edge.toId);
         if (!fromNode || !toNode) return null;
-
-        const isHighlighted =
-          selectedNodeId === edge.fromId || selectedNodeId === edge.toId;
-
+        const isHighlighted = selectedNodeId === edge.fromId || selectedNodeId === edge.toId;
         return (
           <GraphEdge3D
             key={edge.id}
@@ -275,20 +360,16 @@ function Scene({
           node={node}
           isSelected={selectedNodeId === node.id}
           isHovered={hoveredNodeId === node.id}
-          isConnecting={!!connectingFromId && connectingFromId !== node.id}
-          onSelect={setSelectedNode}
+          isConnectSource={connectingFromId === node.id}
+          isConnectTarget={!!connectingFromId && connectingFromId !== node.id}
+          onNodeClick={handleNodeClick}
           onHover={setHoveredNode}
           onDragEnd={handleDragEnd}
-          onConnectClick={handleConnectClick}
         />
       ))}
 
-      {/* Click background to deselect */}
-      <mesh
-        position={[0, 0, -20]}
-        onClick={onBackgroundClick}
-        visible={false}
-      >
+      {/* Invisible background plane to catch deselect clicks */}
+      <mesh position={[0, 0, -20]} onClick={onBackgroundClick} visible={false}>
         <planeGeometry args={[1000, 1000]} />
         <meshBasicMaterial />
       </mesh>
@@ -307,7 +388,7 @@ function Scene({
   );
 }
 
-// ─── Exported canvas ──────────────────────────────────────────────────────────
+// ─── Canvas export ────────────────────────────────────────────────────────────
 
 export function GraphScene() {
   const { setSelectedNode, setConnectingFrom } = useGraphStore();
